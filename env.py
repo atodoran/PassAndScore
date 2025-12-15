@@ -1,9 +1,12 @@
-# Minimal pass-and-score environment without external gym dependency.
 import math
 from dataclasses import dataclass
 from typing import Optional, Tuple, Dict, Any, Union
+
 import numpy as np
 import matplotlib.pyplot as plt
+
+import gymnasium as gym
+from gymnasium import spaces
 
 # Minimal spaces stubs
 class Space:
@@ -69,8 +72,8 @@ class Region:
 
     def contains_point(self, p: np.ndarray) -> bool:
         return (self.xmin <= p[0] <= self.xmax) and (self.ymin <= p[1] <= self.ymax)
-
-class PassAndScoreEnv:
+    
+class PassAndScoreEnv(gym.Env):
     metadata = {"render_modes": ["human"], "render_fps": 30}
 
     def __init__(
@@ -82,7 +85,7 @@ class PassAndScoreEnv:
         field_padding: float = 0.2,
         region_a: Optional[Region] = None,
         region_b: Optional[Region] = None,
-        goal_width: float = 0.4,
+        goal_width: float = 0.8,
         agent_radius: float = 0.05,
         ball_radius: float = 0.03,
         max_speed_agent: float = 1.2,
@@ -92,7 +95,11 @@ class PassAndScoreEnv:
         friction_ball: float = 0.995,
         restitution: float = 0.5,
         sample_interior_ratio: float = 0.8,
+        ball_spawn_region: str = "A",
+        pass_cone_deg: float = 30.0,
+        pass_speed_min_frac: float = 0.1,
     ):
+        super().__init__()
         self.centralized = centralized
         self.dt = dt
         self.max_steps = max_steps
@@ -112,21 +119,38 @@ class PassAndScoreEnv:
 
         self.np_random: np.random.Generator = np.random.default_rng(seed)
         self.sample_interior_ratio = sample_interior_ratio
+        self.ball_spawn_region = ball_spawn_region.upper()
+        self.pass_cone_rad = math.radians(pass_cone_deg)
+        self.pass_speed_min_frac = float(pass_speed_min_frac)
 
         self.goal_y = self.region_b.ymax
         gx_center = (self.region_b.xmin + self.region_b.xmax) / 2.0
         self.goal_xmin = gx_center - self.goal_width / 2.0
         self.goal_xmax = gx_center + self.goal_width / 2.0
-
+        self.pass_line_x = (self.region_a.xmax + self.region_b.xmin) / 2.0
+        
         # actions: 0 stay, 1 up, 2 down, 3 left, 4 right
-        self.single_action_space = Discrete(5)
-        self.action_space = MultiDiscrete([5, 5])
+        self.single_action_space = spaces.Discrete(5)
+        self.action_space = spaces.MultiDiscrete([5, 5])
 
         # Observations:
         # centralized: pA(2), pB(2), vA(2), vB(2), pball(2), vball(2) -> 12
-        self.observation_space_central = Box(-np.inf, np.inf, shape=(12,), dtype=np.float32)
+        self.observation_space_central = spaces.Box(
+            -np.inf, np.inf, shape=(12,), dtype=np.float32
+        )
         # per-agent (decentralized): own p(2), own v(2), rel p ball(2), rel v ball(2), rel p other(2), rel v other(2) -> 12
-        self.observation_space_agent = Box(-np.inf, np.inf, shape=(12,), dtype=np.float32)
+        self.observation_space_agent = spaces.Box(
+            -np.inf, np.inf, shape=(12,), dtype=np.float32
+        )
+
+        # This is what SB3 will look at
+        if self.centralized:
+            self.observation_space = self.observation_space_central
+        else:
+            # not used with SB3 here, but keep it consistent
+            self.observation_space = spaces.Tuple(
+                [self.observation_space_agent, self.observation_space_agent]
+            )
 
         self.state: Dict[str, Any] = {}
         self.fig = None
@@ -144,24 +168,59 @@ class PassAndScoreEnv:
         pB = self.region_b.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
         vA = np.zeros(2, dtype=np.float32)
         vB = np.zeros(2, dtype=np.float32)
-        pball = self.region_b.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
-        vball = np.zeros(2, dtype=np.float32)
 
-        # NEW/CHANGED: track last player to touch the ball; default "A" (so shaping can default to pass-to-B)
+        # --- NEW: ball spawn logic with A-pass support ---
+        if self.ball_spawn_region == "A":
+            region_ball = self.region_a
+            pball = region_ball.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
+            vball = np.zeros(2, dtype=np.float32)
+
+        elif self.ball_spawn_region == "B":
+            region_ball = self.region_b
+            pball = region_ball.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
+            vball = np.zeros(2, dtype=np.float32)
+
+        elif self.ball_spawn_region == "A-PASS":
+            # position: still random in region A
+            region_ball = self.region_a
+            pball = region_ball.sample_point(self.np_random, interior_ratio=self.sample_interior_ratio)
+
+            # direction: cone around +x, symmetric
+            angle = float(self.np_random.uniform(-self.pass_cone_rad, self.pass_cone_rad))
+            dir_vec = np.array(
+                [math.cos(angle), math.sin(angle)],
+                dtype=np.float32,
+            )
+
+            # speed: between pass_speed_min_frac*max_speed_ball and max_speed_ball
+            speed_min = self.pass_speed_min_frac * self.max_speed_ball
+            speed = float(self.np_random.uniform(speed_min, self.max_speed_ball))
+
+            vball = dir_vec * speed
+
+        else:
+            raise ValueError(f"Unknown ball_spawn_region: {self.ball_spawn_region!r}")
+
         self.state = dict(
             pA=pA, pB=pB, vA=vA, vB=vB,
             pball=pball, vball=vball, steps=0,
-            last_touch="A"  # default as requested
+            last_touch="A",
+            touches=0,
+            passes=0,
         )
 
         obs = self._get_obs()
-        info = {}
+        info = self._get_info()
         return obs, info
 
     def step(self, action: Union[np.ndarray, Tuple[int, int]]):
         aA, aB = int(action[0]), int(action[1])
         s = self.state
         info = {"before": self._get_info()}
+        pball_before = s["pball"].copy()
+
+        step_touches = 0
+        step_passes = 0
 
         # action -> direction vector mapping
         def action_vec(a: int) -> np.ndarray:
@@ -182,19 +241,44 @@ class PassAndScoreEnv:
         def cap(v, m):
             sp = np.linalg.norm(v)
             return v * (m / sp) if sp > m else v
+
         s["vA"] = cap(s["vA"], self.max_speed_agent)
         s["vB"] = cap(s["vB"], self.max_speed_agent)
-        # don't pre-cap vball here; we'll cap after impulses / bounces below
 
+        # integrate positions
         s["pA"] = s["pA"] + s["vA"] * self.dt
         s["pB"] = s["pB"] + s["vB"] * self.dt
         s["pball"] = s["pball"] + s["vball"] * self.dt
 
-        # NEW/CHANGED: track last toucher when contact occurs
+        # --- detect wall bumps from clamping ---
+        pA_before = s["pA"].copy()
+        pB_before = s["pB"].copy()
+
+        # Clamp agents to their regions
+        s["pA"][0] = np.clip(s["pA"][0], self.region_a.xmin, self.region_a.xmax)
+        s["pA"][1] = np.clip(s["pA"][1], self.region_a.ymin, self.region_a.ymax)
+        s["pB"][0] = np.clip(s["pB"][0], self.region_b.xmin, self.region_b.xmax)
+        s["pB"][1] = np.clip(s["pB"][1], self.region_b.ymin, self.region_b.ymax)
+
+        bumped_A = bool(
+            (s["pA"][0] != pA_before[0]) or (s["pA"][1] != pA_before[1])
+        )
+        bumped_B = bool(
+            (s["pB"][0] != pB_before[0]) or (s["pB"][1] != pB_before[1])
+        )
+
+        # --- contact / touch detection ---
+        radius_sum = self.agent_radius + self.ball_radius
+
         def try_contact(p_agent, v_agent, who_label: str):
+            nonlocal step_touches
             d = s["pball"] - p_agent
             dist = float(np.linalg.norm(d))
-            if dist < (self.agent_radius + self.ball_radius):
+            if dist < radius_sum:
+                # This *step* counts as a touch for 'who_label'
+                step_touches += 1
+                s["touches"] = s.get("touches", 0) + 1
+
                 vel_norm = np.linalg.norm(v_agent)
                 if vel_norm > 1e-6:
                     dir_imp = v_agent / (vel_norm + 1e-12)
@@ -235,38 +319,60 @@ class PassAndScoreEnv:
             s["pball"][1] = ymin + self.ball_radius
             s["vball"][1] = -s["vball"][1] * self.restitution
         elif s["pball"][1] + self.ball_radius > ymax:
-            # NEW/CHANGED: goal mouth is an opening; don't bounce there
             in_mouth = (self.goal_xmin <= s["pball"][0] <= self.goal_xmax)
             if not in_mouth:
                 s["pball"][1] = ymax - self.ball_radius
                 s["vball"][1] = -s["vball"][1] * self.restitution
-            # else: allow pass-through (no clamp, no reflection)
+
+        rad = self.ball_radius
+        if pball_before[1] >= self.region_b.ymax and s["pball"][1] >= self.region_b.ymax:
+            # Left back wall at x = goal_xmin
+            if (pball_before[0] + rad <= self.goal_xmin) and (s["pball"][0] + rad > self.goal_xmin):
+                s["pball"][0] = self.goal_xmin - rad
+                s["vball"][0] = -abs(s["vball"][0]) * self.restitution
+
+            # Right back wall at x = goal_xmax
+            if (pball_before[0] - rad >= self.goal_xmax) and (s["pball"][0] - rad < self.goal_xmax):
+                s["pball"][0] = self.goal_xmax + rad
+                s["vball"][0] = abs(s["vball"][0]) * self.restitution
 
         # enforce max speed for ball after impulses and bounces
         s["vball"] = cap(s["vball"], self.max_speed_ball)
 
+        pass_line_x = self.pass_line_x
+        crossed_pass_line = (
+            (pball_before[0] < pass_line_x) and
+            (s["pball"][0] >= pass_line_x)
+        )
+        if crossed_pass_line:
+            step_passes += 1
+            s["passes"] = s.get("passes", 0) + 1
+
         # Termination & reward
         terminated = False
-        reward = 0.01
-        left_regions = False
+        reward = -0.01
 
-        if not self.region_a.contains_point(s["pA"]) or not self.region_b.contains_point(s["pB"]):
-            reward = -10.0
-            terminated = True
-            left_regions = True
-
-        # Detect crossing the goal line inside the posts
+        # Detect crossing the goal line inside the posts FROM THE FIELD SIDE (front)
         crossed_goal_line = (
-            s["pball"][1] >= self.region_b.ymax and
-            self.goal_xmin <= s["pball"][0] <= self.goal_xmax and
-            self.region_b.xmin <= s["pball"][0] <= self.region_b.xmax
+            (pball_before[1] < self.region_b.ymax) and  # previously in front
+            (s["pball"][1] >= self.region_b.ymax) and   # now at/behind the line
+            (self.goal_xmin <= s["pball"][0] <= self.goal_xmax) and
+            (self.region_b.xmin <= s["pball"][0] <= self.region_b.xmax)
         )
-        # Only count as a goal if last touch was by B (if you have that rule)
-        is_goal = bool(crossed_goal_line and (s.get("last_touch", "B") == "B"))  # adapt if you removed last_touch
+
+        # Only count as a goal if last touch was by B
+        is_goal = bool(crossed_goal_line and (s.get("last_touch", "B") == "B"))
 
         if is_goal:
             reward = 10.0
             terminated = True
+        
+        terminated_back_cross = False
+        if self.ball_spawn_region == "A-PASS":
+            mid_x = self.pass_line_x
+            if (pball_before[0] > mid_x) and (s["pball"][0] <= mid_x):
+                terminated_back_cross = True
+                terminated = True
 
         s["steps"] += 1
         truncated = (s["steps"] >= self.max_steps) and not terminated
@@ -275,8 +381,15 @@ class PassAndScoreEnv:
         info_after = self._get_info()
         info_after["crossed_goal_mouth"] = bool(crossed_goal_line)
         info_after["scored_goal"] = bool(is_goal)
-        info_after["left_regions"] = bool(left_regions)
+        info_after["bumped_A"] = bumped_A
+        info_after["bumped_B"] = bumped_B
+        info_after["touches"] = int(s.get("touches", 0))      # cumulative over episode
+        info_after["touches_step"] = int(step_touches)        # touches this step
+        info_after["passes"] = int(s.get("passes", 0))
+        info_after["passes_step"] = int(step_passes)
+        info_after["terminated_back_cross"] = bool(terminated_back_cross)
         info["after"] = info_after
+
         return obs, reward, terminated, truncated, info
 
     def _dist_to_goal_mouth(self, bx: float, by: float) -> float:
@@ -328,17 +441,29 @@ class PassAndScoreEnv:
             "dist_ball_to_goal": self._dist_to_goal_mouth(s["pball"][0], s["pball"][1]),
             "dist_A_to_ball": float(np.linalg.norm(s["pA"] - s["pball"])),
             "dist_B_to_ball": dist_B_to_ball,
-            "passed_regions": bool(self.region_b.contains_point(s["pball"])),  # ball in B?
+            "passed_regions": bool(self.region_b.contains_point(s["pball"])),
             "speed_ball": float(np.linalg.norm(s["vball"])),
             "last_touch": s.get("last_touch", "A"),
+            "touches": int(s.get("touches", 0)),
+            "passes": int(s.get("passes", 0)),
         }
         return info
 
-    def render(self):
+
+    def render(self, ax=None):
+        """
+        If ax is None: behave like before (manage self.fig/self.ax).
+        If ax is provided: draw state onto that axes and do NOT show/flush.
+        """
         s = self.state
-        if self.fig is None or self.ax is None:
-            self.fig, self.ax = plt.subplots(figsize=(6.5, 4))
-        ax = self.ax
+
+        external_ax = ax is not None
+
+        if not external_ax:
+            if self.fig is None or self.ax is None:
+                self.fig, self.ax = plt.subplots(figsize=(6.5, 4))
+            ax = self.ax
+
         ax.clear()
 
         xmin = self.region_a.xmin - self.field_padding
@@ -346,35 +471,51 @@ class PassAndScoreEnv:
         ymin = min(self.region_a.ymin, self.region_b.ymin) - self.field_padding
         ymax = max(self.region_a.ymax, self.region_b.ymax) + self.field_padding
 
+        # Regions
         ax.add_patch(plt.Rectangle((self.region_a.xmin, self.region_a.ymin),
                        self.region_a.xmax - self.region_a.xmin,
                        self.region_a.ymax - self.region_a.ymin,
                        fill=False, linewidth=2))
-        ax.text((self.region_a.xmin+self.region_a.xmax)/2, self.region_a.ymax+0.05, "Region A", ha="center", va="bottom")
+        ax.text((self.region_a.xmin+self.region_a.xmax)/2, self.region_a.ymax+0.05,
+                "Region A", ha="center", va="bottom")
 
         ax.add_patch(plt.Rectangle((self.region_b.xmin, self.region_b.ymin),
                        self.region_b.xmax - self.region_b.xmin,
                        self.region_b.ymax - self.region_b.ymin,
                        fill=False, linewidth=2))
-        ax.text((self.region_b.xmin+self.region_b.xmax)/2, self.region_b.ymax+0.05, "Region B", ha="center", va="bottom")
+        ax.text((self.region_b.xmin+self.region_b.xmax)/2, self.region_b.ymax+0.05,
+                "Region B", ha="center", va="bottom")
 
-        ax.plot([self.goal_xmin, self.goal_xmax], [self.region_b.ymax, self.region_b.ymax], linewidth=6)
+        # Goal line + posts
+        ax.plot([self.goal_xmin, self.goal_xmax],
+                [self.region_b.ymax, self.region_b.ymax],
+                linewidth=6)
 
+        back_depth = 0.4
+        ax.plot([self.goal_xmin, self.goal_xmin],
+                [self.region_b.ymax, self.region_b.ymax + back_depth],
+                linewidth=6, color='black')
+        ax.plot([self.goal_xmax, self.goal_xmax],
+                [self.region_b.ymax, self.region_b.ymax + back_depth],
+                linewidth=6, color='black')
+
+        # Agents
         def draw_agent(p, v, label):
             circ = plt.Circle((p[0], p[1]), self.agent_radius, fill=False, linewidth=2)
             ax.add_patch(circ)
-            # arrow direction from velocity if moving, else upward
             speed = np.linalg.norm(v)
             if speed > 1e-6:
                 head = (v / (speed + 1e-12)) * (self.agent_radius * 1.5)
             else:
                 head = np.array([0.0, 1.0]) * (self.agent_radius * 1.5)
-            ax.arrow(p[0], p[1], head[0], head[1], head_width=0.02, length_includes_head=True)
+            ax.arrow(p[0], p[1], head[0], head[1],
+                     head_width=0.02, length_includes_head=True)
             ax.text(p[0], p[1]-0.08, label, ha="center", va="top")
 
         draw_agent(s["pA"], s["vA"], "A")
         draw_agent(s["pB"], s["vB"], "B")
 
+        # Ball
         ball = plt.Circle((s["pball"][0], s["pball"][1]), self.ball_radius, fill=True)
         ax.add_patch(ball)
 
@@ -385,7 +526,7 @@ class PassAndScoreEnv:
         ax.set_xlabel("x")
         ax.set_ylabel("y")
 
-        # Build a compact, human-readable representation of the state
+        # HUD text
         def fmt_item(x):
             try:
                 it = list(x)
@@ -393,7 +534,6 @@ class PassAndScoreEnv:
             except Exception:
                 return f"{float(x):.2f}"
 
-        # NEW/CHANGED: include last_touch in the HUD text
         text_lines = [
             f"steps: {int(s.get('steps', 0))}",
             f"last_touch: {s.get('last_touch', 'A')}",
@@ -406,13 +546,52 @@ class PassAndScoreEnv:
         ]
         state_text = "\n".join(text_lines)
 
-        ax.text(0.98, 0.98, state_text, transform=ax.transAxes,
-            fontsize=8, ha="right", va="top",
-            bbox=dict(facecolor="white", alpha=0.85, edgecolor="black"))
+        ax.text(
+            0.98,
+            0.98,
+            state_text,
+            transform=ax.transAxes,
+            fontsize=8,
+            ha="right",
+            va="top",
+            bbox=dict(facecolor="white", alpha=0.85, edgecolor="black"),
+        )
 
-        plt.show()
+        if not external_ax:
+            # standalone mode: draw/update
+            self.fig.canvas.draw()
+            plt.pause(0.001)
 
     def close(self):
         if self.fig is not None:
             plt.close(self.fig)
         self.fig, self.ax = None, None
+
+
+class PassAndScoreGym(gym.Env):
+    metadata = PassAndScoreEnv.metadata
+
+    def __init__(self):
+        super().__init__()
+        self.env = PassAndScoreEnv(centralized=True)
+        self.action_space = gym_spaces.MultiDiscrete([5, 5])
+        self.observation_space = gym_spaces.Box(
+            low=-np.inf,
+            high=np.inf,
+            shape=(12,),
+            dtype=np.float32,
+        )
+
+    def reset(self, *, seed=None, options=None):
+        obs, info = self.env.reset(seed=seed, options=options)
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        return obs, reward, terminated, truncated, info
+
+    def render(self):
+        self.env.render()
+
+    def close(self):
+        self.env.close()
